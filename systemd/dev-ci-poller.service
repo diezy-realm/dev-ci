@@ -1,0 +1,13 @@
+[Unit]
+Description=dev-ci: local CI for open GitHub PRs (galleon-fleet)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Apps/dev-ci/bin/ci-poller galleon-fleet
+# Per-gate limits live in repos/<repo>/gates.sh; this only stops a wedged poller (cold build ~ hours).
+TimeoutStartSec=28800
+Nice=10
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin

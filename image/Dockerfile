@@ -1,9 +1,7 @@
-# Self-hosted GitHub Actions runner image for galleon-fleet CI.
+# CI image for bin/ci-poller (one-shot `docker run`, no GitHub Actions runner).
 # Toolchain versions come from rust-toolchain.toml (rustup installs on first use).
 FROM ubuntu:24.04
 
-ARG RUNNER_VERSION=2.338.0
-ARG RUNNER_SHA256=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
 ARG NEXTEST_VERSION=0.9.148
 ARG NEXTEST_SHA256=223ba936714cc861a9cdedad5a8eb664dfdd69d6fbdf6cea6aa8184f523290dc
 ARG DENY_VERSION=0.19.9
@@ -14,8 +12,9 @@ ARG AUDIT_VERSION=0.22.2
 ARG AUDIT_SHA256=ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39
 
 ENV DEBIAN_FRONTEND=noninteractive
+# protobuf-compiler: clawcrew-gateway/build.rs needs protoc (the old runner image lacked it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential clang mold pkg-config libssl-dev libudev-dev \
+        build-essential clang mold cmake protobuf-compiler pkg-config libssl-dev libudev-dev \
         ca-certificates curl git jq ripgrep expect gettext python3 python3-pip python3-yaml \
         nodejs npm unzip xz-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -46,11 +45,8 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-to
         && tar -xzf /tmp/dl -C "$CARGO_HOME/bin" --strip-components=1 "sccache-v${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache"; \
     rm -f /tmp/dl
 
-# Volume mount points must pre-exist so Docker keeps them owned by `runner`.
-RUN mkdir -p runner-state .cargo/registry actions-runner/_work && cd actions-runner \
-    && curl -fsSL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" -o r.tgz \
-    && echo "${RUNNER_SHA256}  r.tgz" | sha256sum -c - \
-    && tar -xzf r.tgz && rm r.tgz
+# The poller mounts a per-PR volume here and caches at these paths; they must pre-exist so Docker
+# keeps them owned by `runner`.
+RUN mkdir -p .cargo/registry actions-runner/_work
 
-COPY --chmod=0755 entrypoint.sh trim-target.sh /usr/local/bin/
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+COPY --chmod=0755 trim-target.sh /usr/local/bin/

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the dev-ci PR poller
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Persistent=true
+Unit=dev-ci-poller.service
+
+[Install]
+WantedBy=timers.target

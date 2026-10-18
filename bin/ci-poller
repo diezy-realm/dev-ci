@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""ci-poller <repo> [--dry-run] [--pr N] [--force]
+
+Local CI for GitHub PRs, no GitHub Actions. One run = one poll:
+  1. list open PRs into BASES (same-repo heads, not draft)
+  2. a PR whose head SHA has no final `local/Required Gate` status gets CI:
+     clone the SHA into a throwaway docker volume, run the repo's gates (repos/<repo>/gates.sh)
+     in containers, post one commit status per gate plus the aggregate
+  3. green PRs that match AUTOMERGE_* are squash-merged (head SHA pinned)
+GitHub commit statuses are the only state: no database, nothing to keep in sync.
+Intended to be driven by dev-ci-poller.timer; flock makes overlapping runs a no-op.
+"""
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+AGG = "local/Required Gate"
+WORK = "/home/runner/actions-runner/_work"   # per-PR docker volume; dir pre-exists in the image, owned by runner
+PR_DIR = WORK + "/pr"
+ERROR_RETRY_S = 600                          # an infra `error` aggregate is retried after this long
+KEEP_LOGS = 40
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+
+def load_env(path):
+    cfg = {}
+    for ln in path.read_text().splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#") and "=" in ln:
+            k, v = ln.split("=", 1)
+            cfg[k.strip()] = v.strip()
+    return cfg
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def gh_json(*args):
+    r = run(["gh", *args])
+    if r.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])}: {r.stderr.strip()[:200]}")
+    return json.loads(r.stdout or "null")
+
+
+class Ci:
+    def __init__(self, repo, dry):
+        self.repo, self.dry = repo, dry
+        self.dir = ROOT / "repos" / repo
+        self.cfg = load_env(self.dir / "ci.env")
+        self.slug = self.cfg["REPO_SLUG"]
+        self.mirror = ROOT / "work" / f"{repo}.git"
+        self.logroot = ROOT / "logs" / repo
+        self.gates = self._gates()
+
+    def _gates(self):
+        out = run(["bash", str(self.dir / "gates.sh"), "list"]).stdout
+        gates = []
+        for ln in out.splitlines():
+            n, tier, net, lim, adv = ln.split("|")
+            gates.append(dict(name=n, tier=tier, net=net, limit=int(lim), adv=adv == "1"))
+        return gates
+
+    # ---- GitHub ----
+    def prs(self):
+        bases = set(self.cfg["BASES"].split(","))
+        rows = gh_json("pr", "list", "-R", self.slug, "--state", "open", "--limit", "100", "--json",
+                       "number,baseRefName,headRefName,headRefOid,isDraft,isCrossRepository")
+        rows = [p for p in rows if p["baseRefName"] in bases and not p["isDraft"] and not p["isCrossRepository"]]
+        return sorted(rows, key=lambda p: (p["baseRefName"] != "testing", p["number"]))
+
+    def statuses(self, sha):
+        d = gh_json("api", f"repos/{self.slug}/commits/{sha}/status?per_page=100")
+        return {s["context"]: s for s in d["statuses"]}
+
+    def post(self, sha, context, state, desc):
+        print(f"  status {state:8} {context} -- {desc}", flush=True)
+        if self.dry:
+            return
+        r = run(["gh", "api", "-X", "POST", f"repos/{self.slug}/statuses/{sha}",
+                 "-f", f"state={state}", "-f", f"context={context}", "-f", f"description={desc[:140]}"])
+        if r.returncode != 0:
+            print(f"  ! post status failed: {r.stderr.strip()[:200]}", file=sys.stderr)
+
+    def head_sha(self, n):
+        return gh_json("pr", "view", str(n), "-R", self.slug, "--json", "headRefOid")["headRefOid"]
+
+    # ---- selection ----
+    def needs_ci(self, pr, force):
+        if force:
+            return True
+        agg = self.statuses(pr["headRefOid"]).get(AGG)
+        if agg is None or agg["state"] == "pending":   # pending while we hold the lock = a crashed run
+            return True
+        if agg["state"] == "error":
+            return time.time() - datetime.fromisoformat(agg["updated_at"].replace("Z", "+00:00")).timestamp() > ERROR_RETRY_S
+        return False
+
+    # ---- mirror ----
+    def sync_mirror(self):
+        if not self.mirror.exists():
+            self.mirror.parent.mkdir(parents=True, exist_ok=True)
+            seed = self.cfg.get("SEED")
+            src = seed if seed and Path(seed).is_dir() else f"https://github.com/{self.slug}.git"
+            r = run(["git", "clone", "--bare", "-q", src, str(self.mirror)])
+            if r.returncode:
+                raise RuntimeError(f"mirror clone failed: {r.stderr[:200]}")
+            run(["git", "-C", str(self.mirror), "remote", "set-url", "origin", f"https://github.com/{self.slug}.git"])
+        r = run(["git", "-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential",
+                 "-C", str(self.mirror), "fetch", "-q", "--prune", "origin", "+refs/heads/*:refs/heads/*"])
+        if r.returncode:
+            raise RuntimeError(f"mirror fetch failed: {r.stderr.strip()[:200]}")
+
+    # ---- docker ----
+    def docker(self, label, volume, script, net, limit_min, env, logf, mirror=False):
+        cname = f"dev-ci-{self.repo}-{label}-{os.getpid()}"
+        c = self.cfg
+        v = c["VOL_PREFIX"]
+        cmd = ["timeout", "--kill-after=30", str(limit_min * 60),
+               "docker", "run", "--rm", "--name", cname, "--entrypoint", "bash",
+               "--network", "bridge" if net == "full" else "none",
+               f"--cpus={c['CPUS']}", f"--memory={c['MEM']}", "--pids-limit=2048",
+               "--cap-drop=ALL", "--security-opt=no-new-privileges", "--tmpfs=/tmp:rw,exec,nosuid,nodev",
+               "-v", f"{v}_cargo-home:/home/runner/.cargo/registry",
+               "-v", f"{v}_rustup-home:/home/runner/.rustup",
+               "-v", f"{v}_ci-target:/ci-target",
+               "-v", f"{v}_sccache:/sccache",
+               "-v", f"{volume}:{WORK}",
+               "-v", f"{self.dir / 'gates.sh'}:/gates.sh:ro"]
+        if mirror:
+            cmd += ["-v", f"{self.mirror}:/src.git:ro"]
+        full_env = {"CARGO_TARGET_DIR": "/ci-target", "CI_TARGET_MAX_GB": c["CI_TARGET_MAX_GB"],
+                    "CARGO_TERM_COLOR": "never", "CARGO_INCREMENTAL": "0", "PR_DIR": PR_DIR, "RUNNER_TEMP": "/tmp",
+                    **env}
+        if net != "full":
+            full_env["CARGO_NET_OFFLINE"] = "true"
+        for k, val in full_env.items():
+            cmd += ["-e", f"{k}={val}"]
+        cmd += ["dev-ci:local", "-c", script]
+        t0 = time.time()
+        p = subprocess.run(cmd, stdout=logf, stderr=subprocess.STDOUT)
+        if p.returncode in (124, 137):
+            run(["docker", "rm", "-f", cname])
+        return p.returncode, time.time() - t0
+
+    # ---- one PR ----
+    def prepare(self, vol, sha, base, logpath):
+        """Clone `sha` into the throwaway volume, install the pinned toolchain, fetch deps (network on)."""
+        script = ("set -euo pipefail; git config --global --add safe.directory '*'; trim-target.sh; "
+                  f"git clone -q /src.git {PR_DIR}; cd {PR_DIR}; git checkout -q --detach {sha}; "
+                  "rustup toolchain install >/dev/null 2>&1 || rustup show; cargo fetch --locked")
+        with open(logpath, "w") as lf:
+            return self.docker("prep", vol, script, "full", 30, {"BASE": base, "PR_SHA": sha}, lf, mirror=True)[0]
+
+    def gate(self, vol, g, sha, base, logpath):
+        with open(logpath, "w") as lf:
+            return self.docker(slug(g["name"])[:20], vol, f'bash /gates.sh run "{g["name"]}"',
+                               g["net"], g["limit"], {"BASE": base, "PR_SHA": sha}, lf)
+
+    def base_red(self, mb, base, g, logdir, vols):
+        """True if gate `g` is already red at the PR's merge-base. Cached per (merge-base, gate) so a
+        failure the PR did not cause is never blamed on it (or sent to agy as a fix)."""
+        cache = ROOT / "state" / "baseline" / self.repo / f"{mb}.json"
+        data = json.loads(cache.read_text()) if cache.exists() else {}
+        if g["name"] in data:
+            return data[g["name"]]
+        vol = f"dev-ci-{self.repo}-base-{mb[:8]}"
+        if vol not in vols:
+            vols.append(vol)
+            if self.prepare(vol, mb, base, logdir / "base_prepare.log") != 0:
+                return False
+        rc, _ = self.gate(vol, g, mb, base, logdir / f"base_{slug(g['name'])}.log")
+        if rc == 125:
+            return False                      # docker trouble says nothing about the base
+        data[g["name"]] = rc != 0
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(data))
+        return data[g["name"]]
+
+    def run_pr(self, pr):
+        n, sha, base = pr["number"], pr["headRefOid"], pr["baseRefName"]
+        short = sha[:8]
+        logdir = self.logroot / f"pr{n}-{short}"
+        print(f"PR #{n} {pr['headRefName']} -> {base} @ {short}", flush=True)
+        if self.dry:
+            return
+        logdir.mkdir(parents=True, exist_ok=True)
+        self.post(sha, AGG, "pending", "local CI running")
+        for g in self.gates:
+            self.post(sha, f"local/{g['name']}", "pending", "queued")
+        vols = [f"dev-ci-{self.repo}-pr{n}-{short}"]
+        results = {}      # gate name -> success | failure | error
+        infra_error = False
+        try:
+            rc = self.prepare(vols[0], sha, base, logdir / "prepare.log")
+            if rc != 0:
+                state = "error" if rc == 125 else "failure"
+                self.post(sha, AGG, state, f"prepare failed rc={rc} (clone/toolchain/cargo fetch --locked): logs/pr{n}-{short}/prepare.log")
+                (logdir / "summary.json").write_text(json.dumps({"state": state, "red": ["prepare"]}))
+                for g in self.gates:
+                    self.post(sha, f"local/{g['name']}", "error", "not run: prepare failed")
+                return
+            mb = run(["git", "-C", str(self.mirror), "merge-base", f"refs/heads/{base}", sha]).stdout.strip()
+            guard_red = False
+            for g in self.gates:
+                ctx = f"local/{g['name']}"
+                if g["tier"] == "heavy" and guard_red:
+                    self.post(sha, ctx, "error", "skipped: a guard gate is red")
+                    continue
+                if self.head_sha(n) != sha:
+                    print("  head moved, abandoning this SHA", flush=True)
+                    for g2 in self.gates:
+                        if g2["name"] not in results:
+                            self.post(sha, f"local/{g2['name']}", "error", "superseded by a newer push")
+                    self.post(sha, AGG, "error", "superseded by a newer push")
+                    return
+                rc, dt = self.gate(vols[0], g, sha, base, logdir / f"{slug(g['name'])}.log")
+                took = f"{int(dt // 60)}m{int(dt % 60):02d}s"
+                logrel = f"logs/pr{n}-{short}/{slug(g['name'])}.log"
+                if rc == 0:
+                    results[g["name"]] = "success"
+                    self.post(sha, ctx, "success", f"passed in {took}")
+                elif rc == 125:
+                    results[g["name"]] = "error"
+                    infra_error = True
+                    self.post(sha, ctx, "error", f"docker error: {logrel}")
+                elif not g["adv"] and mb and self.base_red(mb, base, g, logdir, vols):
+                    results[g["name"]] = "success"
+                    self.post(sha, ctx, "success", f"red on {base} too (baseline), not blamed: {logrel}")
+                else:
+                    results[g["name"]] = "failure"
+                    why = f"timeout after {g['limit']}m" if rc in (124, 137) else f"failed rc={rc} in {took}"
+                    self.post(sha, ctx, "failure", f"{why}: {logrel}")
+                    if g["tier"] == "guard" and not g["adv"]:
+                        guard_red = True
+        finally:
+            for v in vols:
+                run(["docker", "volume", "rm", "-f", v])
+        red = [g["name"] for g in self.gates if not g["adv"] and results.get(g["name"]) != "success"]
+        state = "success"
+        if red:
+            state = "error" if infra_error and not any(results.get(x) == "failure" for x in red) else "failure"
+        self.post(sha, AGG, state, "all required gates passed" if not red else "red: " + ", ".join(red))
+        (logdir / "summary.json").write_text(json.dumps({"state": state, "red": [x for x in red if x in results]}))
+        self.prune_logs()
+
+    def prune_logs(self):
+        dirs = sorted((d for d in self.logroot.iterdir() if d.is_dir()), key=lambda d: d.stat().st_mtime)
+        for d in dirs[:-KEEP_LOGS]:
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---- merge ----
+    def automerge(self, prs):
+        bases = set(self.cfg.get("AUTOMERGE_BASES", "").split(","))
+        rx = re.compile(self.cfg.get("AUTOMERGE_HEAD_REGEX", "^$"))
+        for pr in prs:
+            n, sha = pr["number"], pr["headRefOid"]
+            if pr["baseRefName"] not in bases or not rx.search(pr["headRefName"]):
+                continue
+            agg = self.statuses(sha).get(AGG)
+            if not agg or agg["state"] != "success":
+                continue
+            v = gh_json("pr", "view", str(n), "-R", self.slug, "--json", "mergeable,reviewDecision,headRefOid")
+            if v["headRefOid"] != sha or v["mergeable"] != "MERGEABLE" or v["reviewDecision"] == "CHANGES_REQUESTED":
+                print(f"PR #{n}: green but not mergeable now ({v['mergeable']}/{v['reviewDecision']})")
+                continue
+            print(f"PR #{n}: green -> squash-merge into {pr['baseRefName']}", flush=True)
+            if self.dry:
+                continue
+            r = run(["gh", "pr", "merge", str(n), "-R", self.slug, "--squash", "--match-head-commit", sha])
+            print("  merged" if r.returncode == 0 else f"  merge failed: {r.stderr.strip()[:200]}", flush=True)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        sys.exit(__doc__)
+    repo, dry, force = args[0], "--dry-run" in args, "--force" in args
+    only = int(args[args.index("--pr") + 1]) if "--pr" in args else None
+    ci = Ci(repo, dry)
+    (ROOT / "state").mkdir(exist_ok=True)
+    lock = open(ROOT / "state" / f"{repo}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another ci-poller run holds the lock; nothing to do")
+        return
+    done = set()
+    while True:
+        prs = [p for p in ci.prs() if only in (None, p["number"])]
+        todo = [p for p in prs if (p["number"], p["headRefOid"]) not in done and ci.needs_ci(p, force)]
+        if not todo:
+            break
+        ci.sync_mirror()
+        pr = todo[0]
+        done.add((pr["number"], pr["headRefOid"]))
+        ci.run_pr(pr)
+    ci.automerge(ci.prs())
+    print("poll done")
+
+
+if __name__ == "__main__":
+    main()
