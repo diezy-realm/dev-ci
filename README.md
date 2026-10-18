@@ -1,8 +1,15 @@
 # dev-ci
 
-Local CI for GitHub PRs, shared by all repos. No GitHub Actions, no tunnel, no webhook: a systemd timer
-polls GitHub, runs the repo's gates in throwaway containers, and reports back as commit statuses.
+Local CI for GitHub PRs, shared by all repos. No GitHub Actions, no tunnel, no webhook: the board
+bridge fires CI per PR, gates run in throwaway containers, and results report back as commit statuses.
 Local git only (never pushed), like `~/Apps/board`.
+
+**Trigger model (event-driven, not timer):** `board_agy_bridge.py` calls `ci-poller <repo> --pr N` in
+the background the moment a task is parked in `review` (i.e. agy just pushed/updated its PR). One push =
+one CI run. `flock` inside `ci-poller` serializes overlapping runs, so at most one build runs at a time
+(`CPUS=3`, leaving a core for agy/system on this 4-core host). The `systemd/dev-ci-poller.{service,timer}`
+files are kept **only as an inactive backup** (NOT installed/enabled) in case the event trigger is ever
+unavailable; re-arm with `systemctl --user enable --now` from a copy if needed.
 
 | Path | Scope | What |
 |---|---|---|
@@ -24,19 +31,19 @@ Local git only (never pushed), like `~/Apps/board`.
    not blamed (status success, "red on <base> too"). Fix a baseline and the protection comes back automatically.
    Limitation: a gate that is already red on the base cannot catch a new regression of the same gate.
 5. PRs into `AUTOMERGE_BASES` whose head matches `AUTOMERGE_HEAD_REGEX` are squash-merged when green (head SHA pinned).
-   `main` is never auto-merged.
+   `main` is never auto-merged. **Currently OFF** (`AUTOMERGE_BASES=` empty) until PR #47/#48 are cleaned of the
+   Codesmith CI commits; a green PR therefore stays in `review` for a manual merge. Set `AUTOMERGE_BASES=testing` to enable.
 
 GitHub commit statuses are the only state for "was this SHA tested"; the board reads them (`board_switch.py review`).
 
 ## Operate
 ```
-systemctl --user enable --now dev-ci-poller.timer       # interval is editable on the board page (Status view)
-~/Apps/dev-ci/bin/ci-poller galleon-fleet --dry-run     # what would run
-~/Apps/dev-ci/bin/ci-poller galleon-fleet --pr 55 --force
-journalctl --user -u dev-ci-poller -n 50 -o cat
+~/Apps/dev-ci/bin/ci-poller galleon-fleet --dry-run       # what would run
+~/Apps/dev-ci/bin/ci-poller galleon-fleet --pr 55 --force # force a re-run of one PR
 ```
+CI is normally fired by the board bridge per PR (see Trigger model) — you rarely invoke it by hand.
 Rebuild the image after editing `image/`: `docker build -t dev-ci:local ~/Apps/dev-ci/image`.
-Caches live in docker volumes named `<VOL_PREFIX>_{cargo-home,rustup-home,ci-target,sccache}`; `ci-target` is wiped when it passes `CI_TARGET_MAX_GB`.
+Caches live in docker volumes named `<VOL_PREFIX>_{cargo-home,rustup-home,ci-target,sccache}` (VOL_PREFIX=`dev-ci`); `ci-target` is wiped when it passes `CI_TARGET_MAX_GB`.
 
 ## Add a repo
 1. `mkdir repos/<repo>`; copy `ci.env` and `gates.sh` from `repos/galleon-fleet` and edit.
