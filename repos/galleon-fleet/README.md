@@ -1,6 +1,6 @@
 # galleon-fleet CI
 
-Poller: `dev-ci-poller.timer` (interval editable on the board page). Gates: `gates.sh`.
+Trigger: the board (`board_switch.py review`), once per PR head; no timer. Gates: `gates.sh`.
 Mirrors the lanes of `.github/workflows/ci.yml` in the repo (kept because `scripts/ci/*.test.sh` and
 `tests/architecture/ci_runner_labels.rs` parse it); keep the two in step until those readers are retired.
 

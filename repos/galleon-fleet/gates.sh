@@ -136,5 +136,10 @@ case "${1:-}" in
     fn="gate_$(slug "${2:?gate name}")"
     declare -F "$fn" >/dev/null || { echo "no such gate: $2 ($fn)" >&2; exit 2; }
     "$fn" ;;
-  *) echo "usage: gates.sh list | run <name>" >&2; exit 2 ;;
+  prepare)
+    # Network-on step after the poller's `cargo fetch`: that skips standalone crates outside the root
+    # workspace, but every gate runs --offline (the firmware gate inside Test needs this one).
+    cd_pr
+    cargo fetch --locked --manifest-path firmware/clawcrew-fw-protocol/Cargo.toml ;;
+  *) echo "usage: gates.sh list | run <name> | prepare" >&2; exit 2 ;;
 esac

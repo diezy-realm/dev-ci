@@ -4,18 +4,21 @@ Local CI for GitHub PRs, shared by all repos. No GitHub Actions, no tunnel, no w
 bridge fires CI per PR, gates run in throwaway containers, and results report back as commit statuses.
 Local git only (never pushed), like `~/Apps/board`.
 
-**Trigger model (event-driven, not timer):** `board_agy_bridge.py` calls `ci-poller <repo> --pr N` in
-the background the moment a task is parked in `review` (i.e. agy just pushed/updated its PR). One push =
-one CI run. `flock` inside `ci-poller` serializes overlapping runs, so at most one build runs at a time
-(`CPUS=3`, leaving a core for agy/system on this 4-core host). The `systemd/dev-ci-poller.{service,timer}`
-files are kept **only as an inactive backup** (NOT installed/enabled) in case the event trigger is ever
-unavailable; re-arm with `systemctl --user enable --now` from a copy if needed.
+**Trigger model (event-driven, not timer):** `board_switch.py review` (the board-review switcher) looks at
+every task parked in `review` (agy just pushed/updated its PR). When that PR head has no final
+`local/Required Gate` verdict (none yet, `pending`, or `error`) it starts `ci-poller <repo> --pr N` as a
+transient user unit `ci-pr<N>-<sha8>`: its own cgroup, so it outlives the oneshot board service, and the
+unit name makes a duplicate for the same head impossible while one is queued or running. One head = one
+CI run. The blocking `flock` in `ci-poller` queues distinct runs, so at most one build runs at a time
+(`CPUS=3`, leaving a core for agy/system on this 4-core host). Follow a run with
+`journalctl --user -u ci-pr<N>-<sha8>`. The `systemd/dev-ci-poller.{service,timer}` files are kept **only
+as an inactive backup** (NOT installed).
 
 | Path | Scope | What |
 |---|---|---|
 | `bin/ci-poller` | general | `ci-poller <repo> [--dry-run] [--pr N] [--force]`: poll, run gates, post statuses, auto-merge |
 | `image/` | general | Dockerfile of the CI image (`dev-ci:local`: Rust via rustup, protoc, mold, nextest, deny, audit, sccache) |
-| `systemd/` | general | `dev-ci-poller.{service,timer}` (symlinked into `~/.config/systemd/user`) |
+| `systemd/` | general | `dev-ci-poller.{service,timer}`: inactive backup, not installed |
 | `repos/<repo>/ci.env` | per repo | repo slug, target branches, CPU/RAM, auto-merge policy |
 | `repos/<repo>/gates.sh` | per repo | the gate list (`gates.sh list`) and what each gate runs (`gates.sh run <name>`) |
 | `logs/<repo>/pr<N>-<sha8>/` | state | one log per gate + `summary.json`; newest 40 kept |
@@ -47,7 +50,8 @@ Caches live in docker volumes named `<VOL_PREFIX>_{cargo-home,rustup-home,ci-tar
 
 ## Add a repo
 1. `mkdir repos/<repo>`; copy `ci.env` and `gates.sh` from `repos/galleon-fleet` and edit.
-2. `systemd/dev-ci-poller.service` is galleon-fleet specific (`ExecStart ... ci-poller galleon-fleet`); copy it to a new unit per repo.
+2. Add `prepare` to its `gates.sh` (may be empty) and point the repo's board trigger at `ci-poller <repo>`;
+   there is no per-repo systemd unit.
 
 ## Security model
 - Containers: no host home, ssh keys, Docker socket or published ports; all caps dropped; no-new-privileges; CPU, RAM, pid limits.

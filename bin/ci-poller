@@ -8,7 +8,8 @@ Local CI for GitHub PRs, no GitHub Actions. One run = one poll:
      in containers, post one commit status per gate plus the aggregate
   3. green PRs that match AUTOMERGE_* are squash-merged (head SHA pinned)
 GitHub commit statuses are the only state: no database, nothing to keep in sync.
-Intended to be driven by dev-ci-poller.timer; flock makes overlapping runs a no-op.
+Started per PR head by the board (board_switch.py review -> systemd-run unit ci-pr<N>-<sha8>). The blocking
+flock queues overlapping runs one build at a time; needs_ci() makes a run for an already-tested SHA a no-op.
 """
 import fcntl
 import json
@@ -159,7 +160,7 @@ class Ci:
         """Clone `sha` into the throwaway volume, install the pinned toolchain, fetch deps (network on)."""
         script = ("set -euo pipefail; git config --global --add safe.directory '*'; trim-target.sh; "
                   f"git clone -q /src.git {PR_DIR}; cd {PR_DIR}; git checkout -q --detach {sha}; "
-                  "rustup toolchain install >/dev/null 2>&1 || rustup show; cargo fetch --locked")
+                  "rustup toolchain install >/dev/null 2>&1 || rustup show; cargo fetch --locked; bash /gates.sh prepare")
         with open(logpath, "w") as lf:
             return self.docker("prep", vol, script, "full", 30, {"BASE": base, "PR_SHA": sha}, lf, mirror=True)[0]
 
@@ -291,11 +292,8 @@ def main():
     ci = Ci(repo, dry)
     (ROOT / "state").mkdir(exist_ok=True)
     lock = open(ROOT / "state" / f"{repo}.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print("another ci-poller run holds the lock; nothing to do")
-        return
+    # Blocking: a trigger that arrives mid-build waits its turn (one build at a time), it is not dropped.
+    fcntl.flock(lock, fcntl.LOCK_EX)
     done = set()
     while True:
         prs = [p for p in ci.prs() if only in (None, p["number"])]
