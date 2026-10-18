@@ -1,0 +1,57 @@
+# General self-hosted GitHub Actions runner pair. Per-repo values come from repos/<repo>/runner.env
+# via bin/ci-runner. `heavy` compiles, `light` runs guards and governance so a long build never
+# blocks auto-merge. No host home, ssh keys or Docker socket is mounted; all capabilities dropped.
+x-runner: &runner
+  image: dev-ci-runner:local
+  build: .
+  restart: unless-stopped
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  pids_limit: 2048
+  tmpfs: ["/tmp"]
+  environment: &env
+    REPO_URL: ${REPO_URL:?set in repos/<repo>/runner.env}
+    RUNNER_TOKEN: ${RUNNER_TOKEN:-}
+
+services:
+  heavy:
+    <<: *runner
+    cpus: ${HEAVY_CPUS:-3}
+    mem_limit: ${HEAVY_MEM:-14g}
+    environment:
+      <<: *env
+      RUNNER_NAME: ${RUNNER_PREFIX}-heavy
+      RUNNER_LABELS: self-hosted,linux,x64,${RUNNER_PREFIX}-heavy
+      CARGO_TARGET_DIR: /ci-target
+      CI_TARGET_MAX_GB: ${CI_TARGET_MAX_GB:-60}
+    volumes:
+      - heavy-state:/home/runner/runner-state
+      - heavy-work:/home/runner/actions-runner/_work
+      - cargo-home:/home/runner/.cargo/registry
+      - rustup-home:/home/runner/.rustup
+      - ci-target:/ci-target
+      - sccache:/sccache
+
+  light:
+    <<: *runner
+    cpus: ${LIGHT_CPUS:-1}
+    mem_limit: ${LIGHT_MEM:-4g}
+    environment:
+      <<: *env
+      RUNNER_NAME: ${RUNNER_PREFIX}-light
+      RUNNER_LABELS: self-hosted,linux,x64,${RUNNER_PREFIX}-light
+    volumes:
+      - light-state:/home/runner/runner-state
+      - light-work:/home/runner/actions-runner/_work
+      - cargo-home:/home/runner/.cargo/registry
+      - rustup-home:/home/runner/.rustup
+
+volumes:
+  heavy-state:
+  heavy-work:
+  light-state:
+  light-work:
+  cargo-home:
+  rustup-home:
+  ci-target:
+  sccache:
