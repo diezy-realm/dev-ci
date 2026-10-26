@@ -15,7 +15,7 @@ Principle|guard|none|10|0
 Lint|heavy|none|90|0
 Check (no default features)|heavy|none|90|0
 Check (default features, all targets)|heavy|none|90|0
-Test|heavy|none|120|1
+Test|heavy|none|25|1
 Security|heavy|full|30|0'
 # Repository Structure is advisory: .gitmodules declares docs/book/po but the gitlink is absent on
 # testing itself (baseline red). Make it blocking again once testing is fixed.
@@ -118,8 +118,8 @@ gate_test() {
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
   ./scripts/ci/firmware_protocol_gate.sh
-  cargo nextest run --locked --workspace --exclude clawcrew-desktop
-  cargo nextest run --locked --no-fail-fast -p clawcrew-hardware --features hardware --lib
+  cargo nextest run --locked --profile ci --workspace --exclude clawcrew-desktop
+  cargo nextest run --locked --profile ci --no-fail-fast -p clawcrew-hardware --features hardware --lib
 }
 
 gate_security() {
