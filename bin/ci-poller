@@ -131,7 +131,7 @@ class Ci:
         cmd = ["timeout", "--kill-after=30", str(limit_min * 60),
                "docker", "run", "--rm", "--name", cname, "--entrypoint", "bash",
                "--network", "bridge" if net == "full" else "none",
-               f"--cpus={c['CPUS']}", f"--memory={c['MEM']}", "--pids-limit=2048",
+               f"--cpus={c['CPUS']}", f"--cpu-shares={c.get('CPU_SHARES', '256')}", f"--memory={c['MEM']}", "--pids-limit=2048",
                "--cap-drop=ALL", "--security-opt=no-new-privileges", "--tmpfs=/tmp:rw,exec,nosuid,nodev",
                "-v", f"{v}_cargo-home:/home/runner/.cargo/registry",
                "-v", f"{v}_rustup-home:/home/runner/.rustup",

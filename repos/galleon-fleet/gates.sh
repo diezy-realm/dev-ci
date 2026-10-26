@@ -25,6 +25,12 @@ cd_pr() { cd "${PR_DIR:-/home/runner/actions-runner/_work/pr}"; }
 merge_base() { git merge-base "origin/$BASE" HEAD; }
 web_placeholder() { mkdir -p web/dist && touch web/dist/.gitkeep; }
 
+has_rust_changes() {
+  local files
+  files=$(git diff --name-only "$(merge_base)" HEAD -- '*.rs' '*Cargo.toml' '*Cargo.lock' || true)
+  [ -n "$files" ]
+}
+
 gate_format() {
   local files report f st=0
   files=$(git diff --name-only --diff-filter=AM "$(merge_base)" HEAD -- '*.rs' || true)
@@ -83,6 +89,7 @@ gate_principle() {
 }
 
 gate_lint() {
+  has_rust_changes || { echo "no rust changes; skipping gate"; return 0; }
   web_placeholder
   bash scripts/ci/run_clippy.test.sh
   bash scripts/ci/run_clippy.sh --scope workspace --summary-title "Lint diagnostics" --log-name cargo-clippy.log
@@ -94,16 +101,19 @@ gate_lint() {
 }
 
 gate_check_no_default_features() {
+  has_rust_changes || { echo "no rust changes; skipping gate"; return 0; }
   web_placeholder
   RUSTFLAGS="-D warnings" cargo check --locked --workspace --exclude clawcrew-desktop --no-default-features
 }
 
 gate_check_default_features_all_targets() {
+  has_rust_changes || { echo "no rust changes; skipping gate"; return 0; }
   web_placeholder
   RUSTFLAGS="-D warnings" cargo check --locked --workspace --exclude clawcrew-desktop --all-targets
 }
 
 gate_test() {
+  has_rust_changes || { echo "no rust changes; skipping gate"; return 0; }
   web_placeholder
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
   export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
@@ -114,8 +124,12 @@ gate_test() {
 
 gate_security() {
   python3 scripts/ci/lru_advisory_scope_test.py
-  cargo deny check
-  cargo verify-project && cargo fetch --locked
+  if has_rust_changes; then
+    cargo deny check
+    cargo verify-project && cargo fetch --locked
+  else
+    echo "no rust changes; skipping cargo deny / cargo verify-project"
+  fi
   python3 - <<'PY'
 import yaml
 for p in (".github/workflows/ci.yml", ".github/workflows/windows-tests.yml",
@@ -124,7 +138,11 @@ for p in (".github/workflows/ci.yml", ".github/workflows/windows-tests.yml",
     yaml.safe_load(open(p)); print(p, "valid")
 PY
   python3 -m unittest discover -s scripts/github -p '*_test.py'
-  cargo audit
+  if has_rust_changes; then
+    cargo audit
+  else
+    echo "no rust changes; skipping cargo audit"
+  fi
 }
 
 slug() { tr '[:upper:]' '[:lower:]' <<<"$1" | sed -E 's/[^a-z0-9]+/_/g; s/^_|_$//g'; }
